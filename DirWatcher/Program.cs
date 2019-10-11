@@ -1,56 +1,93 @@
-﻿using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-
-namespace DirWatcher
+﻿namespace DirWatcher
 {
-    public class Program
+    using System;
+    using System.Collections.Generic;
+    using System.IO;
+    using System.Linq;
+    using System.Reflection;
+    using System.Threading;
+    using System.Threading.Tasks;
+
+    public static class Program
     {
         public static async Task Main(string[] args)
         {
-            var cts = new CancellationTokenSource();
+            if (args == null)
+            {
+                throw new ArgumentNullException(nameof(args));
+            }
+
+            if (args.Length != 2)
+            {
+                Console.WriteLine(GetUsage());
+            }
+
+            using var cts = new CancellationTokenSource();
             var pathToWatch = args[0];
             var pattern = args[1];
 
             var outstandingTasks = new List<Task>();
             var waitDuration = TimeSpan.FromSeconds(10);
-            var oldState = await InitializeDirectoryState(ScanDirectory(pathToWatch, pattern).Values, cts.Token);
-            //Init your watcher
+            var oldState = await InitializeDirectoryState(ScanDirectory(pathToWatch, pattern).Values, cts.Token).ConfigureAwait(false);
+
+            // Init your watcher
             var timerTask = WaitMessageAsync(waitDuration, cts.Token);
+            var endingTask = TerminateOnKeyPressAsync(cts);
             outstandingTasks.Add(timerTask);
+            outstandingTasks.Add(endingTask);
 
             while (!cts.Token.IsCancellationRequested)
             {
                 if (timerTask.IsCompleted)
                 {
-                    //Fire up the new timer
+                    // Fire up the new timer
                     timerTask = WaitMessageAsync(waitDuration, cts.Token);
                     outstandingTasks.Add(timerTask);
 
-                    //Start working on your new answers
+                    // Start working on your new answers
                     var newState = ScanDirectory(pathToWatch, pattern);
                     var changes = GetChangedFiles(oldState, newState, cts.Token);
                     outstandingTasks.AddRange(changes);
                 }
 
-                //If any of the work you ask for is done, this will return
-                var completedTask = await Task.WhenAny(outstandingTasks);
+                // If any of the work you ask for is done, this will return
+                var completedTask = await Task.WhenAny(outstandingTasks).ConfigureAwait(false);
                 outstandingTasks.Remove(completedTask);
 
-                //Unwrap the message and push it to the console
-                if (completedTask is Task<string> stringTask)
+                switch (completedTask)
                 {
-                    var message = await stringTask;
-                    Console.WriteLine(message);
+                    // Unwrap the message and push it to the console
+                    case Task<string> stringTask:
+                    {
+                        var message = await stringTask.ConfigureAwait(false);
+                        Console.WriteLine(message);
+                        break;
+                    }
+
+                    case Task<WatcherFileStateChange> stateChangeTask:
+                    {
+                        var stateChange = await stateChangeTask.ConfigureAwait(false);
+                        oldState = ApplyStateChange(oldState, stateChange);
+                        Console.WriteLine(stateChange.ToString());
+                        break;
+                    }
                 }
-                else if (completedTask is Task<WatcherFileStateChange> stateChangeTask)
+            }
+        }
+
+        private static string GetUsage()
+        {
+            return $"{Assembly.GetExecutingAssembly().GetName().FullName} <Path to watch> <File filter>";
+        }
+
+        private static async Task TerminateOnKeyPressAsync(CancellationTokenSource cts)
+        {
+            while (!cts.IsCancellationRequested)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(100), cts.Token).ConfigureAwait(false);
+                if (Console.KeyAvailable)
                 {
-                    var stateChange = await stateChangeTask;
-                    oldState = ApplyStateChange(oldState, stateChange);
-                    Console.WriteLine(stateChange.ToString());
+                    cts.Cancel();
                 }
             }
         }
@@ -73,18 +110,20 @@ namespace DirWatcher
                 case StateChangeActionEnum.None:
                     break;
             }
+
             return newState;
         }
 
         private static async Task<Dictionary<string, WatcherFileState>> InitializeDirectoryState(IEnumerable<WatcherFileIdentifier> identifiers, CancellationToken cancellationToken)
         {
-            var taskList = identifiers.Select(i => GetFileLineCount(i, cancellationToken));
-            return (await Task.WhenAll(taskList)).ToDictionary(wfs => wfs.FileIdentifier.Path);
+            var taskList = identifiers.Select(i => i.GetFileLineCount(cancellationToken));
+            return (await Task.WhenAll(taskList).ConfigureAwait(false)).ToDictionary(wfs => wfs.FileIdentifier.Path);
         }
 
-        private static IEnumerable<Task<WatcherFileStateChange>> GetChangedFiles(Dictionary<string, WatcherFileState> oldState,
-                                                                                 Dictionary<string, WatcherFileIdentifier> newIdentifiers,
-                                                                                 CancellationToken cancellationToken)
+        private static IEnumerable<Task<WatcherFileStateChange>> GetChangedFiles(
+                                                                    Dictionary<string, WatcherFileState> oldState,
+                                                                    Dictionary<string, WatcherFileIdentifier> newIdentifiers,
+                                                                    CancellationToken cancellationToken)
         {
             var filesInBoth = oldState.Keys.Intersect(newIdentifiers.Keys);
             foreach (var file in filesInBoth)
@@ -108,174 +147,23 @@ namespace DirWatcher
 
         private static async Task<WatcherFileStateChange> GetChangedStateAsync(WatcherFileState oldState, WatcherFileIdentifier newIdentifier, CancellationToken cancellationToken)
         {
-            var newState = await GetFileLineCount(newIdentifier, cancellationToken);
+            var newState = await newIdentifier.GetFileLineCount(cancellationToken).ConfigureAwait(false);
             return new WatcherFileStateChange(oldState, newState);
         }
 
         private static async Task<string> WaitMessageAsync(TimeSpan waitDuration, CancellationToken cancellationToken)
         {
             // Don't access the console down here, just do it in main
-            await Task.Delay(waitDuration, cancellationToken);
+            await Task.Delay(waitDuration, cancellationToken).ConfigureAwait(false);
             return "10 second check in";
         }
 
         private static Dictionary<string, WatcherFileIdentifier> ScanDirectory(string path, string pattern)
         {
-            return (from file in Directory.EnumerateFiles(path, pattern) 
+            return (from file in Directory.EnumerateFiles(path, pattern)
                         let modifiedTime = File.GetLastWriteTimeUtc(file)
-                        select new WatcherFileIdentifier(file, modifiedTime)
-                       ).ToDictionary(w => w.Path);
-        }
-
-        private static async Task<WatcherFileState> GetFileLineCount(WatcherFileIdentifier fileIdentifier, CancellationToken cancellationToken)
-        {
-            await using var stream = File.OpenRead(fileIdentifier.Path);
-            var lines = await CountLines(stream, cancellationToken);
-            return new WatcherFileState(fileIdentifier, lines);
-        }
-
-        //https://github.com/NimaAra/Easy.Common/blob/master/Easy.Common/Extensions/StreamExtensions.cs#L46
-        public static async Task<int> CountLines(Stream stream, CancellationToken cancellationToken)
-        {
-            if(stream == null)
-            {
-                throw new ArgumentNullException(nameof(stream));
-            }
-
-            const char lf = '\n';
-            const char cr = '\r';
-            const char NULL = (char)0;
-
-            var lineCount = 0;
-
-            var byteBuffer = new byte[1024 * 1024];
-            var detectedEol = NULL;
-            var currentChar = NULL;
-
-            int bytesRead;
-            while ((bytesRead = (await stream.ReadAsync(byteBuffer, 0, byteBuffer.Length, cancellationToken))) > 0)
-            {
-                for (var i = 0; i < bytesRead; i++)
-                {
-                    currentChar = (char)byteBuffer[i];
-
-                    if (detectedEol != NULL)
-                    {
-                        if (currentChar == detectedEol)
-                        {
-                            lineCount++;
-                        }
-                    }
-                    else if (currentChar == lf || currentChar == cr)
-                    {
-                        detectedEol = currentChar;
-                        lineCount++;
-                    }
-                }
-            }
-
-            if (currentChar != lf && currentChar != cr && currentChar != NULL)
-            {
-                lineCount++;
-            }
-
-            return lineCount;
-        }
-
-        private class WatcherFileIdentifier
-        {
-            public string Path { get; }
-            public string Name => System.IO.Path.GetFileName(Path);
-            public DateTime ModifiedTime { get; }
-
-            public WatcherFileIdentifier(string path, DateTime modifiedTime)
-            {
-                Path = path;
-                ModifiedTime = modifiedTime;
-            }
-        }
-
-        private class WatcherFileState
-        {
-            public WatcherFileIdentifier FileIdentifier { get; }
-            public int NumberOfLines { get; }
-
-            public WatcherFileState(WatcherFileIdentifier identifier, int numberOfLines)
-            {
-                FileIdentifier = identifier;
-                NumberOfLines = numberOfLines;
-            }
-        }
-
-        private class WatcherFileStateChange
-        {
-            private WatcherFileState OldState { get; }
-            public WatcherFileState NewState { get; }
-
-            private string Name { get; }
-            public string Path { get; }
-
-            public WatcherFileStateChange(WatcherFileState oldState, WatcherFileState newState)
-            {
-                if (oldState == null && newState == null)
-                {
-                    throw new ArgumentException("One of the states must be non null");
-                }
-
-                OldState = oldState;
-                NewState = newState;
-                Path = oldState?.FileIdentifier.Path ??
-                       newState?.FileIdentifier.Path;
-                Name = oldState?.FileIdentifier.Name ??
-                       newState?.FileIdentifier.Name;
-            }
-
-            public StateChangeActionEnum Action
-            {
-                get
-                {
-                    if (OldState == null)
-                    {
-                        return StateChangeActionEnum.New;
-                    }
-                    if (NewState == null)
-                    {
-                        return StateChangeActionEnum.Deleted;
-                    }
-                    if (OldState.NumberOfLines != NewState.NumberOfLines)
-                    {
-                        return StateChangeActionEnum.Changed;
-                    }
-                    return StateChangeActionEnum.None;
-                }
-            }
-
-            public override string ToString()
-            {
-                switch (Action)
-                {
-                    case StateChangeActionEnum.New:
-                        return $"{Name} {NewState.NumberOfLines}";
-                    case StateChangeActionEnum.Deleted:
-                        return $"{Name}";
-                    case StateChangeActionEnum.Changed:
-                        var changeSize = NewState.NumberOfLines - OldState.NumberOfLines;
-                        var changeSign = changeSize > 0 ? "+" : "-";
-                        return $"{Name} {changeSign}{changeSize}";
-                    case StateChangeActionEnum.None:
-                        return string.Empty;
-                    default:
-                        throw new ArgumentOutOfRangeException();
-                }
-            }
-        }
-
-        private enum StateChangeActionEnum
-        {
-            New,
-            Deleted,
-            Changed,
-            None
+                        select new WatcherFileIdentifier(file, modifiedTime))
+                    .ToDictionary(w => w.Path);
         }
     }
 }
