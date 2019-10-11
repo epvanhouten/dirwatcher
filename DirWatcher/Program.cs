@@ -12,16 +12,15 @@ namespace DirWatcher
         public static async Task Main(string[] args)
         {
             var cts = new CancellationTokenSource();
-            Console.CancelKeyPress += (o, s) => { cts.Cancel(); };
             var pathToWatch = args[0];
             var pattern = args[1];
-            
 
             var outstandingTasks = new List<Task>();
             var waitDuration = TimeSpan.FromSeconds(10);
             var oldState = await InitializeDirectoryState(ScanDirectory(pathToWatch, pattern).Values, cts.Token);
             //Init your watcher
             var timerTask = WaitMessageAsync(waitDuration, cts.Token);
+            outstandingTasks.Add(timerTask);
 
             while (!cts.Token.IsCancellationRequested)
             {
@@ -50,9 +49,31 @@ namespace DirWatcher
                 else if (completedTask is Task<WatcherFileStateChange> stateChangeTask)
                 {
                     var stateChange = await stateChangeTask;
+                    oldState = ApplyStateChange(oldState, stateChange);
                     Console.WriteLine(stateChange.ToString());
                 }
             }
+        }
+
+        private static Dictionary<string, WatcherFileState> ApplyStateChange(Dictionary<string, WatcherFileState> oldState, WatcherFileStateChange stateChange)
+        {
+            var newState = new Dictionary<string, WatcherFileState>(oldState);
+
+            switch (stateChange.Action)
+            {
+                case StateChangeActionEnum.New:
+                    newState.Add(stateChange.Path, stateChange.NewState);
+                    break;
+                case StateChangeActionEnum.Deleted:
+                    newState.Remove(stateChange.Path);
+                    break;
+                case StateChangeActionEnum.Changed:
+                    newState[stateChange.Path] = stateChange.NewState;
+                    break;
+                case StateChangeActionEnum.None:
+                    break;
+            }
+            return newState;
         }
 
         private static async Task<Dictionary<string, WatcherFileState>> InitializeDirectoryState(IEnumerable<WatcherFileIdentifier> identifiers, CancellationToken cancellationToken)
@@ -65,7 +86,7 @@ namespace DirWatcher
                                                                                  Dictionary<string, WatcherFileIdentifier> newIdentifiers,
                                                                                  CancellationToken cancellationToken)
         {
-            var filesInBoth = oldState.Keys.Union(newIdentifiers.Keys);
+            var filesInBoth = oldState.Keys.Intersect(newIdentifiers.Keys);
             foreach (var file in filesInBoth)
             {
                 if (oldState[file].FileIdentifier.ModifiedTime < newIdentifiers[file].ModifiedTime)
@@ -189,9 +210,10 @@ namespace DirWatcher
         private class WatcherFileStateChange
         {
             private WatcherFileState OldState { get; }
-            private WatcherFileState NewState { get; }
+            public WatcherFileState NewState { get; }
 
             private string Name { get; }
+            public string Path { get; }
 
             public WatcherFileStateChange(WatcherFileState oldState, WatcherFileState newState)
             {
@@ -202,11 +224,13 @@ namespace DirWatcher
 
                 OldState = oldState;
                 NewState = newState;
+                Path = oldState?.FileIdentifier.Path ??
+                       newState?.FileIdentifier.Path;
                 Name = oldState?.FileIdentifier.Name ??
                        newState?.FileIdentifier.Name;
             }
 
-            private StateChangeActionEnum Action
+            public StateChangeActionEnum Action
             {
                 get
                 {
@@ -235,7 +259,9 @@ namespace DirWatcher
                     case StateChangeActionEnum.Deleted:
                         return $"{Name}";
                     case StateChangeActionEnum.Changed:
-                        return $"{Name} {NewState.NumberOfLines - OldState.NumberOfLines}";
+                        var changeSize = NewState.NumberOfLines - OldState.NumberOfLines;
+                        var changeSign = changeSize > 0 ? "+" : "-";
+                        return $"{Name} {changeSign}{changeSize}";
                     case StateChangeActionEnum.None:
                         return string.Empty;
                     default:
